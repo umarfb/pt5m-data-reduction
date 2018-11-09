@@ -1,48 +1,147 @@
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from astropy import wcs
 from astropy import units as u
 from astropy.io import fits
 from astropy.io import ascii
+from astropy.stats import SigmaClip
 from astropy.coordinates import SkyCoord
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from ucac4 import extract_star_array as get_local_ucac4
 
+# method to convert pixel coordinates to RA and Dec
+'''
+    Parameters:
+    - file_name: file containing table of sources detected on image
+    - fits_image: fits image
+
+    Returns:
+    - sources: table updated with RA and Dec of sources
+'''
+def pix2wcs(file_name, fits_image):
+    # read in list of image sources into astropy table
+    sources = ascii.read(file_name)
+
+    # get pixel coordinates from pt5m image
+    x_pix = np.array(sources['xcenter'].data)
+    y_pix = np.array(sources['ycenter'].data)
+    pix_coords = np.vstack((x_pix, y_pix)).T
+
+    hdulist = fits.open(fits_image)   # Load FITS hdulist
+    w = wcs.WCS(hdulist[0].header)  # parse WCS keywords in primary HDU
+
+    # Convert pixel coordinates to RA and Dec
+    world = w.wcs_pix2world(pix_coords, 1)
+    sky_coords = SkyCoord(world, frame='icrs', unit='deg')
+
+    sources['ra'] = sky_coords.ra
+    sources['dec'] = sky_coords.dec
+    return sources
+
+# method to get centre of image
+'''
+    Returns RA and Dec of image centre
+'''
+def get_cr(fits_image):
+    hdulist = fits.open(fits_image)   # Load FITS hdulist
+    w = wcs.WCS(hdulist[0].header)  # parse WCS keywords in primary HDU
+
+    cr_ra = hdulist[0].header['CRVAL1']
+    cr_dec = hdulist[0].header['CRVAL2']
+    return cr_ra, cr_dec
+
+# method to get dimensions of image
+'''
+    Returns width and height of image in degrees, and 1 pixel separation in degrees
+'''
+def get_dims(fits_image):
+    hdulist = fits.open(fits_image)   # Load FITS hdulist
+    w = wcs.WCS(hdulist[0].header)  # parse WCS keywords in primary HDU
+
+    x_range = hdulist[0].header['NAXIS1']
+    y_range = hdulist[0].header['NAXIS2']
+    # convert pixels to RA and Dec
+    lim_coords = w.wcs_pix2world([[0,0], [x_range,y_range]], 1)
+    lim_coords = SkyCoord(lim_coords, frame='icrs', unit='deg')
+    width = (lim_coords.ra.max() - lim_coords.ra.min())
+    height = (lim_coords.dec.max() - lim_coords.dec.min())
+    pix_sep = ((width/x_range) + (height/y_range)) / 2
+    return width, height, pix_sep
+
+# method to calculate error in the mean
+def std_error_mean(data, err_data):
+    n = len(data)
+    sq_sum = 0
+
+    for i in range(n):
+        sq_sum += err_data[i] ** 2
+    
+    error = np.sqrt(sq_sum)/n
+    return error
+
+# method to determine zero point for magnitude calibration using UCAC4 catalog
+'''
+   Parameters:
+   - sources : table file for sources detected in image
+   - fits_image: fits image of science frame
+   - filter_name : filter used in image
+   - radius : separation threshold to match images stars to catalog stars (in pixels)
+   - mag : column header for instrumental magnitudes
+
+   Returns:
+   - zp: median clipped zero point for image magnitude calibration
+   - zp_err: uncertainty in zero point
+   - n_total: number of matched sources used
+   - n_rej: number of rejected sources
+   - delta_m = array of difference between catalog and instrumental magnitudes
+   - ucac4_mag = array of matched catalog star magnitudes
+'''
+def find_zp(sources, fits_image, filter_name, radius, mag):
+    sources = pix2wcs(sources, fits_image)
+    # get RA and Dec for sources
+    src_coords = SkyCoord(sources['ra'], sources['dec'], unit=u.deg)
+
+    ra, dec = get_cr(fits_image)    # get centre of image
+    width, height, pix_sep = get_dims(fits_image)   # get dimensions and unit separation on image
+
+    min_sep = radius * pix_sep
+
+    ucac4 = get_local_ucac4(ra, dec, width.deg, height.deg)
+    good_mags = (ucac4[filter_name] < 18)
+    ucac4 = ucac4[good_mags]
+    ucac4_coords = SkyCoord(ucac4['ra'], ucac4['dec'], unit='deg')  # gets RA and Dec of stars from catalog
+    
+    idx, sep, _ = src_coords.match_to_catalog_sky(ucac4_coords)
+    mask = sep < min_sep
+ 
+    delta_m = ucac4[filter_name][idx] - sources[mag]
+    delta_m = delta_m[mask]
+    ntotal = len(delta_m)   
+    ucac4_mag = ucac4[filter_name][idx]
+    ucac4_mag = ucac4_mag[mask]
+
+    filter_name_error = 'e_' + filter_name  # get magnitude error of catalog stars
+    e_mag = ucac4[filter_name_error][idx]
+    e_mag = e_mag[mask]
+
+    # sigma clip data
+    sc = SigmaClip(sigma=3, iters=4)
+    filtered_delta_m = sc(delta_m)
+    mask = ~filtered_delta_m.mask
+
+    nrej = ntotal - np.sum(mask)    # number of rejected sources
+    zp = np.ma.median(filtered_delta_m)     # sigma-clipped zero point
+
+    zp_err = std_error_mean(ucac4_mag, e_mag)   # zero point error
+
+    #zp_err = filtered_delta_m.std()/np.sqrt(np.sum(mask))   # zero point error
+
+    return zp, zp_err, ntotal, nrej, delta_m, ucac4_mag
+
 path = '/local/php18ufb/backed_up_on_astro3/mini_project01/data20183009/'
 
-filter_name = input('Specify filter name: ')
-if filter_name.upper() in ('B', 'V', 'R', 'I'):
-    filter_name = filter_name.upper()
-else:
-    raise ValueError('filter does not exist for pt5m')
-
-filename = path + 'aperture_photometry/' + filter_name + '_final_sources.txt'
-fitsname = path + filter_name + '_final.fits'
-
-# read in list of source data
-sources = pd.read_csv(filename)
-source_id = sources['id'].values
-
-# get pixel coordinates from pt5m image
-pix_coords = sources[['xcenter', 'ycenter']].values
-
-# Load FITS hdulist
-hdulist = fits.open(fitsname)
-
-# parse WCS keywords in primary HDU
-w = wcs.WCS(hdulist[0].header)
-
-# determine exposure time
-t_exp = hdulist[0].header['EXPTIME']
-
-# Convert pixel coordinates to world coordinates
-world = w.wcs_pix2world(pix_coords, 1)
-wd_coords = SkyCoord(world, frame='icrs', unit='deg')
-
-# get counts from pt5m image and calculate instrumental magnitude
-img_counts = sources['residual_aperture_sum'].values
-inst_mag = - 2.5 * np.log10(img_counts/t_exp)
+filter_letter = input('Specify filter name: ')
+filter_name = filter_letter
 
 if filter_name.upper() in ('B', 'V'):
     filter_name = 'mag_' + filter_name.upper()
@@ -51,45 +150,45 @@ elif filter_name.lower() in ('r', 'i'):
 else:
     raise ValueError('cannot calibrate filter {} against UCAC4'.format(filter_name))
 
-# specify centre of field, and dimensions
-ra = hdulist[0].header['CRVAL1']
-dec = hdulist[0].header['CRVAL2']
-lim_coords = w.wcs_pix2world([[0,0], [1092,736]], 1)
-lim_coords = SkyCoord(lim_coords, frame='icrs', unit='deg')
-width = (lim_coords.ra.max() - lim_coords.ra.min())
-height = (lim_coords.dec.max() - lim_coords.dec.min())
+filename = path + 'aperture_photometry/' + filter_letter.upper() + '_final_sources.txt'
+fitsname = path + filter_letter.upper() + '_final.fits'
 
-# find corresponding catalog stars and remove catalog stars outside pt5m fov
-ucac4 = get_local_ucac4(ra, dec, width.deg, height.deg)
-good_mags = (ucac4[filter_name] < 18)
-ucac4 = ucac4[good_mags]
+zp, zp_err, ntot, nrej, delta_m, ucac4_mag = find_zp(filename, fitsname, filter_name, 4, 'mag_inst')
 
-ucac4_rm_idx = []
-for i in range(len(ucac4)):
-    star = ucac4[i]
-    pix_pos = w.wcs_world2pix([[star['ra'], star['dec']]], 1)
-    x_pix = pix_pos[0,0]
-    y_pix = pix_pos[0,1]
-    
-    if x_pix > 0 and x_pix < 1092:
-        pass
-    else:
-        ucac4_rm_idx.append(i)
+print('zero point in ' + filter_letter.upper() + ' band is: ' + str(np.round(zp, 2)) + ' +/-' + str(np.round(zp_err, 2)))
 
-ucac4.remove_rows(ucac4_rm_idx)
-#print(len(ucac4))
+# calculate object magnitudes
+sources = ascii.read(filename)
+mag_obj = sources['mag_inst'] + zp
+sources['mag_obj'] = mag_obj
 
-# convert catalog stars RA and Dec to pixel coordinates
-ucac4_coords = SkyCoord(ucac4['ra'], ucac4['dec'], unit='deg')
-ucac4_pos = []
+# calculate error in object magnitudes
+mag_inst_err = sources['mag_inst_err']
+mag_obj_err = np.sqrt((mag_inst_err ** 2) + (zp_err ** 2))
+sources['mag_obj_err'] = mag_obj_err
 
-for pos in ucac4_coords:
-    ucac4_pos.append([pos.ra.degree, pos.dec.degree])
+# write magnitudes to file
+file = open(filename, 'w')
+sources.write(file, format='csv')
+file.close()
 
-ucac4_pix = w.wcs_world2pix(ucac4_pos, 1)
+plt.scatter(mag_obj, mag_obj_err, marker='.', color='#002db3')
+plt.xlabel('$m_{obj}$')
+plt.ylabel('$\sigma_m$')
+plt.title(filter_letter.upper() + ' band')
+plt.show()
 
 '''
-
+plt.scatter(ucac4_mag, delta_m, marker='.')
+plt.plot([ucac4_mag.min() / 1.05, ucac4_mag.max() * 1.05], [zp, zp], color='r', linestyle='--', lw=1)
+plt.ylim(delta_m.min() / 1.025, delta_m.max() * 1.025)
+plt.xlim(ucac4_mag.min() / 1.025, ucac4_mag.max() * 1.025)
+plt.xlabel('$m_{cat}$')
+plt.ylabel('$\Delta m$')
+plt.title(filter_letter.upper() + ' band')
+plt.show()
+'''
+'''
 img_data = fits.getdata(fitsname)
 
 # creates ZScale interval as used by DS9
@@ -99,29 +198,11 @@ interval.get_limits(img_data)
 # show matched catalog stars
 norm = ImageNormalize(img_data, interval=ZScaleInterval())
 plt.figure(figsize=(9,12))          # set figure size
+#plt.xlim(1092)
+#plt.ylim(736)
 plt.imshow(img_data, cmap='Greys', origin='lower', norm=norm)
-plt.scatter(ucac4_pix[:,0], ucac4_pix[:,1])
+plt.scatter(ucac4_pix[:,0], ucac4_pix[:,1], color='g', lw=2, marker='o')
+plt.scatter(sources['xcenter'], sources['ycenter'], color='r', lw=2, marker='x')
 plt.show()
-
-idx, sep, _ = wd_coords.match_to_catalog_sky(ucac4_coords)
-
-# calculate magnitude difference
-delta_m = ucac4[filter_name][idx] - inst_mag
-#print(inst_mag)
-#print(np.median(delta_m), np.std(delta_m)/np.sqrt(len(delta_m)))
-
-# define instrument zero point
-zp = np.median(delta_m)
-
-m_obj = inst_mag + zp
-
-for j in range(len(source_id)):
-    print(source_id[i], '\t', int(pix_coords[j][0]), int(pix_coords[j][1]), '\t', np.round(m_obj[j], 2))
-
-plt.scatter(ucac4[filter_name][idx], delta_m)
-plt.title('R band')
-plt.xlabel('$m_{cat}$')
-plt.ylabel('$\Delta m$')
-plt.savefig('cal_plot.pdf', format='pdf', bbox_inches='tight')
-plt.show()
+#plt.savefig('cal_skyplot.pdf', format='pdf', dpi=300, bbox_inches='tight')
 '''
